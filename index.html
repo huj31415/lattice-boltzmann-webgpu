@@ -1,3 +1,5 @@
+<!-- 99% credit to chatgpt -->
+
 <!DOCTYPE html>
 <html lang="en">
 
@@ -5,6 +7,10 @@
   <meta charset="UTF-8">
   <title>2D Lattice Boltzmann Simulation with WebGPU</title>
   <style>
+    html {
+      color-scheme: dark;
+    }
+
     body {
       font-family: sans-serif;
     }
@@ -40,12 +46,15 @@
       <label for="velocity">Rightward Flow Velocity:</label>
       <input id="velocity" type="range" min="0" max="1" step="0.01" value="0.1">
       <span id="velocityValue">0.10</span>
+      <label for="viscosity">Viscosity</label>
+      <input id="viscosity" type="range" min="0.005" max="0.2" step="0.005" value="0.05">
+      <span id="viscosityValue">0.05</span>
       <button id="reinit">Reinitialize Simulation</button>
     </div>
     <div class="control-group">
       <label for="simSpeed">Simulation speed:</label>
-      <input id="simSpeed" type="range" min="0" max="50" step="1" value="10">
-      <span id="simSpeedValue">0.10</span>
+      <input id="simSpeed" type="range" min="0" max="50" step="1" value="1">
+      <span id="simSpeedValue">1</span>
     </div>
     <div class="control-group">
       <label for="barrierUpload">Upload Barrier Image:</label>
@@ -76,7 +85,7 @@
       const gridHeight = 512;
       const numCells = gridWidth * gridHeight;
       const numDirs = 9; // D2Q9
-      const tau = 0.6;   // Relaxation time
+      let tau = 0.6;   // Relaxation time
 
       let speed = 1;
 
@@ -103,19 +112,23 @@
       let stateBuffer0 = device.createBuffer({
         size: stateBufferSize,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+        label: "state0"
       });
       let stateBuffer1 = device.createBuffer({
         size: stateBufferSize,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+        label: "state1"
       });
       const postCollisionBuffer = device.createBuffer({
         size: stateBufferSize,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+        label: "postCollision"
       });
       const barrierBufferSize = numCells * Int32Array.BYTES_PER_ELEMENT;
       const barrierBuffer = device.createBuffer({
         size: barrierBufferSize,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        label: "barrier"
       });
 
       // ----- Uniform Buffer -----
@@ -126,6 +139,7 @@
       const uniformBuffer = device.createBuffer({
         size: uniformData.byteLength,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        label: "uniform"
       });
       device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer);
 
@@ -213,10 +227,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
   }
 }
   `;
-      const collisionModule = device.createShaderModule({ code: collisionShaderCode });
+      const collisionModule = device.createShaderModule({ code: collisionShaderCode, label: "collisionModule" });
       const collisionPipeline = device.createComputePipeline({
         layout: 'auto',
         compute: { module: collisionModule, entryPoint: 'main' },
+        label: "collisionPipeline"
       });
       const collisionBindGroup = (stateBufferIn) => device.createBindGroup({
         layout: collisionPipeline.getBindGroupLayout(0),
@@ -226,6 +241,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
           { binding: 2, resource: { buffer: barrierBuffer } },
           { binding: 3, resource: { buffer: uniformBuffer } },
         ],
+        label: "collisionBindGroup"
       });
 
       // ----- Streaming Compute Shader -----
@@ -311,10 +327,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
   }
 }
   `;
-      const streamingModule = device.createShaderModule({ code: streamingShaderCode });
+      const streamingModule = device.createShaderModule({ code: streamingShaderCode, label: "streamingModule" });
       const streamingPipeline = device.createComputePipeline({
         layout: 'auto',
         compute: { module: streamingModule, entryPoint: 'main' },
+        label: "streamingPipeline"
       });
       const streamingBindGroup = (stateBufferOut) => device.createBindGroup({
         layout: streamingPipeline.getBindGroupLayout(0),
@@ -323,6 +340,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
           { binding: 1, resource: { buffer: stateBufferOut } },
           { binding: 2, resource: { buffer: uniformBuffer } },
         ],
+        label: "streamingBindGroup"
       });
 
       // ----- Render Pipeline (Visualization) -----
@@ -464,12 +482,13 @@ fn fs_main(@location(0) fragCoord: vec2<f32>) -> @location(0) vec4<f32> {
   return vec4<f32>(color, 1.0);
 }
   `;
-      const renderModule = device.createShaderModule({ code: renderShaderCode });
+      const renderModule = device.createShaderModule({ code: renderShaderCode, label: "renderModule" });
       const renderPipeline = device.createRenderPipeline({
         layout: 'auto',
         vertex: { module: renderModule, entryPoint: 'vs_main' },
         fragment: { module: renderModule, entryPoint: 'fs_main', targets: [{ format: swapChainFormat }] },
         primitive: { topology: 'triangle-list' },
+        label: "renderPipeline"
       });
       const renderBindGroup = (stateBufferForRender) => device.createBindGroup({
         layout: renderPipeline.getBindGroupLayout(0),
@@ -478,6 +497,7 @@ fn fs_main(@location(0) fragCoord: vec2<f32>) -> @location(0) vec4<f32> {
           { binding: 1, resource: { buffer: uniformBuffer } },
           { binding: 2, resource: { buffer: barrierBuffer } },
         ],
+        label: "renderBindGroup"
       });
 
       // ----- Visualization UI Control -----
@@ -502,6 +522,17 @@ fn fs_main(@location(0) fragCoord: vec2<f32>) -> @location(0) vec4<f32> {
       document.getElementById("reinit").addEventListener("click", () => {
         const v = parseFloat(velocitySlider.value);
         initializeState(v);
+      });
+
+      // Viscosity
+      const viscositySlider = document.getElementById("viscosity");
+      const viscosityValue = document.getElementById("viscosityValue");
+      viscositySlider.addEventListener("input", () => {
+        const v = parseFloat(viscositySlider.value);
+        viscosityValue.textContent = v.toFixed(2);
+        tau = (3 * v + 0.5);
+        uniformData[2] = tau;
+        device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer);
       });
 
       // Simulation speed
