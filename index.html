@@ -36,10 +36,10 @@
     <div class="control-group">
       <label for="visualization">Visualization Mode:</label>
       <select id="visualization">
-        <option value="density">Density</option>
-        <option value="speed">Speed</option>
         <option value="curl">Curl</option>
         <option value="schlieren">Schlieren</option>
+        <option value="speed">Speed</option>
+        <option value="density">Density</option>
       </select>
     </div>
     <div class="control-group">
@@ -135,7 +135,7 @@
       // Uniforms now include an extra "inflow" field (rightward flow velocity)
       // Layout: [gridWidth, gridHeight, tau, vizMode, inflow]
       let inflow = parseFloat(document.getElementById("velocity").value);
-      const uniformData = new Float32Array([gridWidth, gridHeight, tau, 0, inflow]);
+      const uniformData = new Float32Array([gridWidth, gridHeight, tau, 2, inflow]);
       const uniformBuffer = device.createBuffer({
         size: uniformData.byteLength,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -272,29 +272,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
   let height = i32(uniforms.gridHeight);
   if (x >= width || y >= height) { return; }
   let index = y * width + x;
-  //for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
-  //  // For horizontal directions, don't wrap around:
-  //  let rawSrcX = x - i32(ex[d]);
-  //  var useEquilibrium = false;
-  //  var srcIdx: i32 = 0;
-  //  if (rawSrcX < 0 || rawSrcX >= width) {
-  //    useEquilibrium = true;
-  //  } else {
-  //    let srcX = rawSrcX;
-  //    let srcY = (y - i32(ey[d]) + height) % height;
-  //    let srcIndex = srcY * width + srcX;
-  //    srcIdx = srcIndex * i32(numDirs) + i32(d);
-  //  }
-  //  let targetIdx = index * i32(numDirs) + i32(d);
-  //  if (useEquilibrium) {
-  //    let U = uniforms.inflow;
-  //    let edotu = f32(ex[d]) * U; // inflow is only in x, so uy=0.
-  //    let feq = weights[d] * 1.0 * (1.0 + 3.0 * edotu + 4.5 * edotu * edotu - 1.5 * (U * U));
-  //    stateOut[targetIdx] = feq;
-  //  } else {
-  //    stateOut[targetIdx] = postCollision[srcIdx];
-  //  }
-  //}
   for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
     let rawSrcX = x - i32(ex[d]);
     let rawSrcY = y - i32(ey[d]);
