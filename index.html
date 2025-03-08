@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>2D Lattice Boltzmann Simulation with WebGPU</title>
+  <style>
+    body {
+      font-family: sans-serif;
+    }
+
+    canvas {
+      border: 1px solid #888;
+      image-rendering: pixelated;
+    }
+
+    #controls {
+      margin-top: 10px;
+    }
+
+    .control-group {
+      margin-bottom: 5px;
+    }
+  </style>
+</head>
+
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="controls">
+    <div class="control-group">
+      <label for="visualization">Visualization Mode:</label>
+      <select id="visualization">
+        <option value="density">Density</option>
+        <option value="speed">Speed</option>
+        <option value="curl">Curl</option>
+        <option value="schlieren">Schlieren</option>
+      </select>
+    </div>
+    <div class="control-group">
+      <label for="velocity">Rightward Flow Velocity:</label>
+      <input id="velocity" type="range" min="0" max="1" step="0.01" value="0.1">
+      <span id="velocityValue">0.10</span>
+      <button id="reinit">Reinitialize Simulation</button>
+    </div>
+    <div class="control-group">
+      <label for="simSpeed">Simulation speed:</label>
+      <input id="simSpeed" type="range" min="0" max="50" step="1" value="10">
+      <span id="simSpeedValue">0.10</span>
+    </div>
+    <div class="control-group">
+      <label for="barrierUpload">Upload Barrier Image:</label>
+      <input id="barrierUpload" type="file" accept="image/*">
+      <br>
+      <label for="threshold">Barrier Threshold:</label>
+      <input id="threshold" type="range" min="0" max="1" step="0.01" value="0.5">
+      <span id="thresholdValue">0.50</span>
+      <label for="imageScale">Image scale</label>
+      <input id="imageScale" type="range" min="0.1" max="1" step="0.01" value=".25">
+      <input id="barrierInvert" type="checkbox">
+      <label for="barrierInvert">Invert image</label>
+      <button id="applyBarrierImage">Apply Barrier Image</button>
+      <button id="clearBarriers">Clear barriers</button>
+    </div>
+    <p>Click on the canvas to toggle barrier cells (barriers appear in red).</p>
+  </div>
+  <script type="module">
+    (async () => {
+      if (!navigator.gpu) {
+        document.body.textContent = "WebGPU is not supported in this browser.";
+        return;
+      }
+      const scale = 2;
+
+      // ----- Simulation Parameters -----
+      const gridWidth = 1024;
+      const gridHeight = 512;
+      const numCells = gridWidth * gridHeight;
+      const numDirs = 9; // D2Q9
+      const tau = 0.6;   // Relaxation time
+
+      let speed = 1;
+
+      // D2Q9 weights and lattice vectors.
+      const weights = [4 / 9, 1 / 9, 1 / 9, 1 / 9, 1 / 9, 1 / 36, 1 / 36, 1 / 36, 1 / 36];
+      const ex = [0, 1, 0, -1, 0, 1, -1, -1, 1];
+      const ey = [0, 0, 1, 0, -1, 1, 1, -1, -1];
+
+      // ----- WebGPU Setup -----
+      const canvas = document.getElementById("canvas");
+      canvas.width = gridWidth * scale;
+      canvas.height = gridHeight * scale;
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+      const context = canvas.getContext("webgpu");
+      const swapChainFormat = "bgra8unorm";
+      context.configure({
+        device: device,
+        format: swapChainFormat,
+      });
+
+      // ----- Buffers -----
+      const stateBufferSize = numCells * numDirs * Float32Array.BYTES_PER_ELEMENT;
+      let stateBuffer0 = device.createBuffer({
+        size: stateBufferSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      });
+      let stateBuffer1 = device.createBuffer({
+        size: stateBufferSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      });
+      const postCollisionBuffer = device.createBuffer({
+        size: stateBufferSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+      const barrierBufferSize = numCells * Int32Array.BYTES_PER_ELEMENT;
+      const barrierBuffer = device.createBuffer({
+        size: barrierBufferSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+
+      // ----- Uniform Buffer -----
+      // Uniforms now include an extra "inflow" field (rightward flow velocity)
+      // Layout: [gridWidth, gridHeight, tau, vizMode, inflow]
+      let inflow = parseFloat(document.getElementById("velocity").value);
+      const uniformData = new Float32Array([gridWidth, gridHeight, tau, 0, inflow]);
+      const uniformBuffer = device.createBuffer({
+        size: uniformData.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer);
+
+      // ----- Simulation Initialization -----
+      // Initialize with uniform rightward flow (density=1, velocity=(inflow,0))
+      function initializeState(rightwardFlow) {
+        const initialState = new Float32Array(numCells * numDirs);
+        const density = 1.0;
+        const u0 = rightwardFlow;
+        const u1 = 0.0;
+        const uSq = u0 * u0 + u1 * u1;
+        for (let i = 0; i < numCells; i++) {
+          for (let d = 0; d < numDirs; d++) {
+            const edotu = ex[d] * u0 + ey[d] * u1;
+            const feq = weights[d] * density * (1 + 3 * edotu + 4.5 * edotu * edotu - 1.5 * uSq);
+            initialState[i * numDirs + d] = feq;
+          }
+        }
+        device.queue.writeBuffer(stateBuffer0, 0, initialState.buffer);
+        device.queue.writeBuffer(stateBuffer1, 0, initialState.buffer);
+      }
+      initializeState(inflow);
+
+      // Initially, no barriers.
+      const barrierInit = new Int32Array(numCells);
+      device.queue.writeBuffer(barrierBuffer, 0, barrierInit.buffer);
+
+      // ----- Collision Compute Shader -----
+      // Note: Uniforms now include "inflow", though collision pass doesn't use it.
+      const collisionShaderCode = `
+struct Uniforms {
+  gridWidth: f32,
+  gridHeight: f32,
+  tau: f32,
+  vizMode: f32,
+  inflow: f32,
+};
+@group(0) @binding(0) var<storage, read> stateIn: array<f32>;
+@group(0) @binding(1) var<storage, read_write> postCollision: array<f32>;
+@group(0) @binding(2) var<storage, read> barriers: array<i32>;
+@group(0) @binding(3) var<uniform> uniforms: Uniforms;
+
+const numDirs: u32 = 9u;
+const weights: array<f32, 9> = array<f32, 9>(4.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0);
+const ex: array<i32, 9> = array<i32, 9>(0, 1, 0, -1, 0, 1, -1, -1, 1);
+const ey: array<i32, 9> = array<i32, 9>(0, 0, 1, 0, -1, 1, 1, -1, -1);
+const opp: array<u32, 9> = array<u32, 9>(0, 3, 4, 1, 2, 7, 8, 5, 6);
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+  let x = i32(global_id.x);
+  let y = i32(global_id.y);
+  let width = i32(uniforms.gridWidth);
+  let height = i32(uniforms.gridHeight);
+  if (x >= width || y >= height) { return; }
+  let index = y * width + x;
+  let isBarrier = barriers[index];
+
+  var density: f32 = 0.0;
+  var ux: f32 = 0.0;
+  var uy: f32 = 0.0;
+  for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
+    let idx = index * i32(numDirs) + i32(d);
+    let f = stateIn[idx];
+    density = density + f;
+    ux = ux + f * f32(ex[d]);
+    uy = uy + f * f32(ey[d]);
+  }
+  if (density > 0.0) {
+    ux = ux / density;
+    uy = uy / density;
+  }
+  
+  for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
+    let idx = index * i32(numDirs) + i32(d);
+    let edotu = f32(ex[d]) * ux + f32(ey[d]) * uy;
+    let uSq = ux * ux + uy * uy;
+    let feq = weights[d] * density * (1.0 + 3.0 * edotu + 4.5 * edotu * edotu - 1.5 * uSq);
+    var f_post = stateIn[idx] - (stateIn[idx] - feq) / uniforms.tau;
+    if (isBarrier == 1) {
+      let oppIdx = index * i32(numDirs) + i32(opp[d]);
+      f_post = stateIn[oppIdx];
+    }
+    postCollision[idx] = f_post;
+  }
+}
+  `;
+      const collisionModule = device.createShaderModule({ code: collisionShaderCode });
+      const collisionPipeline = device.createComputePipeline({
+        layout: 'auto',
+        compute: { module: collisionModule, entryPoint: 'main' },
+      });
+      const collisionBindGroup = (stateBufferIn) => device.createBindGroup({
+        layout: collisionPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: stateBufferIn } },
+          { binding: 1, resource: { buffer: postCollisionBuffer } },
+          { binding: 2, resource: { buffer: barrierBuffer } },
+          { binding: 3, resource: { buffer: uniformBuffer } },
+        ],
+      });
+
+      // ----- Streaming Compute Shader -----
+      // Now with non–periodic horizontal boundaries. For x-direction, if the neighbor is out of bounds,
+      // the equilibrium distribution (with density=1, velocity=(inflow, 0)) is used.
+      const streamingShaderCode = `
+struct Uniforms {
+  gridWidth: f32,
+  gridHeight: f32,
+  tau: f32,
+  vizMode: f32,
+  inflow: f32,
+};
+@group(0) @binding(0) var<storage, read> postCollision: array<f32>;
+@group(0) @binding(1) var<storage, read_write> stateOut: array<f32>;
+@group(0) @binding(2) var<uniform> uniforms: Uniforms;
+
+const numDirs: u32 = 9u;
+const weights: array<f32, 9> = array<f32, 9>(4.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0);
+const ex: array<i32, 9> = array<i32, 9>(0, 1, 0, -1, 0, 1, -1, -1, 1);
+const ey: array<i32, 9> = array<i32, 9>(0, 0, 1, 0, -1, 1, 1, -1, -1);
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+  let x = i32(global_id.x);
+  let y = i32(global_id.y);
+  let width = i32(uniforms.gridWidth);
+  let height = i32(uniforms.gridHeight);
+  if (x >= width || y >= height) { return; }
+  let index = y * width + x;
+  //for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
+  //  // For horizontal directions, don't wrap around:
+  //  let rawSrcX = x - i32(ex[d]);
+  //  var useEquilibrium = false;
+  //  var srcIdx: i32 = 0;
+  //  if (rawSrcX < 0 || rawSrcX >= width) {
+  //    useEquilibrium = true;
+  //  } else {
+  //    let srcX = rawSrcX;
+  //    let srcY = (y - i32(ey[d]) + height) % height;
+  //    let srcIndex = srcY * width + srcX;
+  //    srcIdx = srcIndex * i32(numDirs) + i32(d);
+  //  }
+  //  let targetIdx = index * i32(numDirs) + i32(d);
+  //  if (useEquilibrium) {
+  //    let U = uniforms.inflow;
+  //    let edotu = f32(ex[d]) * U; // inflow is only in x, so uy=0.
+  //    let feq = weights[d] * 1.0 * (1.0 + 3.0 * edotu + 4.5 * edotu * edotu - 1.5 * (U * U));
+  //    stateOut[targetIdx] = feq;
+  //  } else {
+  //    stateOut[targetIdx] = postCollision[srcIdx];
+  //  }
+  //}
+  for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
+    let rawSrcX = x - i32(ex[d]);
+    let rawSrcY = y - i32(ey[d]);
+    var useEquilibrium = false;
+    var useBounceBack = false;
+    var srcIdx: i32 = 0;
+    if (rawSrcX < 0 || rawSrcX >= width) {
+      useEquilibrium = true;
+    } else if (rawSrcY < 0 || rawSrcY >= height) {
+      useBounceBack = true;
+    } else {
+      let srcX = rawSrcX;
+      let srcY = rawSrcY;
+      let srcIndex = srcY * width + srcX;
+      srcIdx = srcIndex * i32(numDirs) + i32(d);
+    }
+    let targetIdx = index * i32(numDirs) + i32(d);
+    if (useEquilibrium) {
+      let U = uniforms.inflow;
+      let edotu = f32(ex[d]) * U; // inflow is only in x, so uy=0.
+      let feq = weights[d] * 1.0 * (1.0 + 3.0 * edotu + 4.5 * edotu * edotu - 1.5 * (U * U));
+      stateOut[targetIdx] = feq;
+    } else if (useBounceBack) {
+      // Bounce-back: use the opposite direction value from the same cell.
+      let opp: array<u32, 9> = array<u32, 9>(0, 3, 4, 1, 2, 7, 8, 5, 6);
+      stateOut[targetIdx] = postCollision[index * i32(numDirs) + i32(opp[d])];
+    } else {
+      stateOut[targetIdx] = postCollision[srcIdx];
+    }
+  }
+}
+  `;
+      const streamingModule = device.createShaderModule({ code: streamingShaderCode });
+      const streamingPipeline = device.createComputePipeline({
+        layout: 'auto',
+        compute: { module: streamingModule, entryPoint: 'main' },
+      });
+      const streamingBindGroup = (stateBufferOut) => device.createBindGroup({
+        layout: streamingPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: postCollisionBuffer } },
+          { binding: 1, resource: { buffer: stateBufferOut } },
+          { binding: 2, resource: { buffer: uniformBuffer } },
+        ],
+      });
+
+      // ----- Render Pipeline (Visualization) -----
+      // The render shader now also reads the barrier buffer and renders barriers in red.
+      const renderShaderCode = `
+struct Uniforms {
+  gridWidth: f32,
+  gridHeight: f32,
+  tau: f32,
+  vizMode: f32,
+  inflow: f32,
+};
+@group(0) @binding(0) var<storage, read> state: array<f32>;
+@group(0) @binding(1) var<uniform> uniforms: Uniforms;
+@group(0) @binding(2) var<storage, read> barriers: array<i32>;
+
+struct VertexOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) fragCoord: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
+  var pos = array<vec2<f32>, 6>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 1.0, -1.0),
+    vec2<f32>(-1.0,  1.0),
+    vec2<f32>(-1.0,  1.0),
+    vec2<f32>( 1.0, -1.0),
+    vec2<f32>( 1.0,  1.0)
+  );
+  var output: VertexOut;
+  output.position = vec4<f32>(pos[vertexIndex], 0.0, 1.0);
+  output.fragCoord = 0.5 * (pos[vertexIndex] + vec2<f32>(1.0)) * vec2<f32>(uniforms.gridWidth, uniforms.gridHeight);
+  return output;
+}
+
+fn colorMap(value:f32) -> vec3<f32> {
+  return vec3<f32>(1.0 - value, 1.0 - abs(value - 0.5), value);
+}
+
+@fragment
+fn fs_main(@location(0) fragCoord: vec2<f32>) -> @location(0) vec4<f32> {
+  let x = i32(fragCoord.x);
+  let y = i32(fragCoord.y);
+  let width = i32(uniforms.gridWidth);
+  let index = y * width + x;
+  
+  // If this cell is a barrier, show red.
+  if (barriers[index] == 1) {
+    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+  }
+  
+  let numDirs: u32 = 9u;
+  var density: f32 = 0.0;
+  var ux: f32 = 0.0;
+  var uy: f32 = 0.0;
+  for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
+    let f = state[index * i32(numDirs) + i32(d)];
+    density = density + f;
+    ux = ux + f * f32(array<i32,9>(0,1,0,-1,0,1,-1,-1,1)[d]);
+    uy = uy + f * f32(array<i32,9>(0,0,1,0,-1,1,1,-1,-1)[d]);
+  }
+  if (density > 0.0) {
+    ux = ux / density;
+    uy = uy / density;
+  }
+  let speed = sqrt(ux * ux + uy * uy);
+  //let speedScaled = speed * 0.5;
+  
+  var dudy: f32 = 0.0;
+  var dudx: f32 = 0.0;
+  if (x > 0 && x < width - 1) {
+    var uyL: f32 = 0.0;
+    var uyR: f32 = 0.0;
+    let indexL = y * width + (x - 1);
+    let indexR = y * width + (x + 1);
+    for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
+      uyL = uyL + state[indexL * i32(numDirs) + i32(d)] * f32(array<i32,9>(0,0,1,0,-1,1,1,-1,-1)[d]);
+      uyR = uyR + state[indexR * i32(numDirs) + i32(d)] * f32(array<i32,9>(0,0,1,0,-1,1,1,-1,-1)[d]);
+    }
+    dudy = (uyR - uyL) * 0.5;
+  }
+  if (y > 0 && y < i32(uniforms.gridHeight) - 1) {
+    var uxT: f32 = 0.0;
+    var uxB: f32 = 0.0;
+    let indexT = (y - 1) * width + x;
+    let indexB = (y + 1) * width + x;
+    for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
+      uxT = uxT + state[indexT * i32(numDirs) + i32(d)] * f32(array<i32,9>(0,1,0,-1,0,1,-1,-1,1)[d]);
+      uxB = uxB + state[indexB * i32(numDirs) + i32(d)] * f32(array<i32,9>(0,1,0,-1,0,1,-1,-1,1)[d]);
+    }
+    dudx = (uxB - uxT) * 0.5;
+  }
+  let curl = (dudy - dudx) * 50.0;
+  
+  var color: vec3<f32>;
+  if (uniforms.vizMode < 0.5) {
+    color = vec3<f32>(density / 2.);
+  } else if (uniforms.vizMode < 1.5) {
+    color = colorMap(speed);
+  } else if (uniforms.vizMode < 2.5) {
+    color = vec3<f32>(abs(curl));
+  } else {
+    // Schlieren mode: compute gradient of density.
+    var densityL: f32 = 0.0;
+    var densityR: f32 = 0.0;
+    var densityT: f32 = 0.0;
+    var densityB: f32 = 0.0;
+    if (x > 0) {
+      let indexL = y * width + (x - 1);
+      for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
+         densityL += state[indexL * i32(numDirs) + i32(d)];
+      }
+    } else { densityL = density; }
+    if (x < width - 1) {
+      let indexR = y * width + (x + 1);
+      for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
+         densityR += state[indexR * i32(numDirs) + i32(d)];
+      }
+    } else { densityR = density; }
+    if (y > 0) {
+      let indexT = (y - 1) * width + x;
+      for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
+         densityT += state[indexT * i32(numDirs) + i32(d)];
+      }
+    } else { densityT = density; }
+    if (y < i32(uniforms.gridHeight) - 1) {
+      let indexB = (y + 1) * width + x;
+      for (var d: u32 = 0u; d < numDirs; d = d + 1u) {
+         densityB += state[indexB * i32(numDirs) + i32(d)];
+      }
+    } else { densityB = density; }
+    let dDensityX = (densityR - densityL) * 0.5;
+    let dDensityY = (densityB - densityT) * 0.5;
+    let gradDensity = sqrt(dDensityX * dDensityX + dDensityY * dDensityY);
+    color = vec3<f32>(gradDensity * 100.0);
+  }
+  return vec4<f32>(color, 1.0);
+}
+  `;
+      const renderModule = device.createShaderModule({ code: renderShaderCode });
+      const renderPipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: renderModule, entryPoint: 'vs_main' },
+        fragment: { module: renderModule, entryPoint: 'fs_main', targets: [{ format: swapChainFormat }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      const renderBindGroup = (stateBufferForRender) => device.createBindGroup({
+        layout: renderPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: stateBufferForRender } },
+          { binding: 1, resource: { buffer: uniformBuffer } },
+          { binding: 2, resource: { buffer: barrierBuffer } },
+        ],
+      });
+
+      // ----- Visualization UI Control -----
+      const vizSelect = document.getElementById("visualization");
+      vizSelect.addEventListener("change", () => {
+        const mode = vizSelect.value;
+        const modeVal = mode === "density" ? 0 : mode === "speed" ? 1 : mode === "curl" ? 2 : 3;
+        uniformData[3] = modeVal;
+        device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer);
+      });
+
+      // Rightward flow UI.
+      const velocitySlider = document.getElementById("velocity");
+      const velocityValue = document.getElementById("velocityValue");
+      velocitySlider.addEventListener("input", () => {
+        const v = parseFloat(velocitySlider.value);
+        velocityValue.textContent = v.toFixed(2);
+        // Update uniform inflow parameter as well.
+        uniformData[4] = v;
+        device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer);
+      });
+      document.getElementById("reinit").addEventListener("click", () => {
+        const v = parseFloat(velocitySlider.value);
+        initializeState(v);
+      });
+
+      // Simulation speed
+      const simSpeedSlider = document.getElementById("simSpeed");
+      const simSpeedValue = document.getElementById("simSpeedValue");
+      simSpeedSlider.addEventListener("input", () => {
+        const v = parseInt(simSpeedSlider.value);
+        simSpeedValue.textContent = v;
+        speed = v;
+      });
+
+      // ----- Barrier Setting (Mouse Click) -----
+      // Flip the y coordinate so that clicking maps directly to simulation coordinates.
+      const barrierArray = new Int32Array(numCells);
+      let isDrawing = false;
+      let erase;
+      canvas.addEventListener("mousedown", (event) => {
+        isDrawing = true;
+        placeBarrier(event);
+      });
+      canvas.addEventListener("mousemove", (event) => {
+        if (isDrawing) {
+          placeBarrier(event);
+        }
+      });
+      canvas.addEventListener("mouseup", () => {
+        isDrawing = false;
+        erase = null;
+      });
+      function placeBarrier(event) {
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / scale / rect.width;
+        const scaleY = canvas.height / scale / rect.height;
+        const x = Math.floor((event.clientX - rect.left) * scaleX);
+        // Flip y so that the top of the canvas is y=gridHeight-1.
+        const y = gridHeight - 1 - Math.floor((event.clientY - rect.top) * scaleY);
+        const index = y * gridWidth + x;
+        if (erase === null) erase = barrierArray[index] === 0 ? 1 : 0;
+        barrierArray[index] = erase; //barrierArray[index] === 0 ? 1 : 0;
+        device.queue.writeBuffer(barrierBuffer, index * Int32Array.BYTES_PER_ELEMENT, new Int32Array([barrierArray[index]]));
+      }
+
+      // ----- Barrier Image Upload & Processing -----
+      const barrierUpload = document.getElementById("barrierUpload");
+      const thresholdSlider = document.getElementById("threshold");
+      const thresholdValue = document.getElementById("thresholdValue");
+      thresholdSlider.addEventListener("input", () => {
+        const t = parseFloat(thresholdSlider.value);
+        thresholdValue.textContent = t.toFixed(2);
+      });
+      document.getElementById("applyBarrierImage").addEventListener("click", () => {
+        if (!barrierUpload.files || barrierUpload.files.length === 0) return;
+        clearBarriers();
+        const file = barrierUpload.files[0];
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const img = new Image();
+          img.onload = () => {
+            // Determine target size (e.g., 1/4 of grid width)
+            const targetWidth = Math.round(gridWidth * parseFloat(document.getElementById("imageScale").value));
+            const aspect = img.height / img.width;
+            const targetHeight = targetWidth * aspect;
+            // Create offscreen canvas to draw the scaled image.
+            const offCanvas = document.createElement("canvas");
+            offCanvas.width = targetWidth;
+            offCanvas.height = targetHeight;
+            const offCtx = offCanvas.getContext("2d");
+            offCtx.drawImage(img, 0, 0, targetWidth, targetHeight);
+            const imageData = offCtx.getImageData(0, 0, targetWidth, targetHeight);
+            // Compute offsets to center the barrier image in the simulation grid.
+            const offsetX = Math.floor((gridWidth - targetWidth) / 2);
+            const offsetY = Math.floor((gridHeight - targetHeight) / 2);
+            const threshold = parseFloat(thresholdSlider.value);
+            // Update barrierArray: set to 1 for pixels with brightness above threshold.
+            for (let j = 0; j < targetHeight; j++) {
+              for (let i = 0; i < targetWidth; i++) {
+                const idx = ((targetHeight - j) * targetWidth + i) * 4;
+                // Compute normalized brightness (simple average of R, G, B).
+                const b = (imageData.data[idx] + imageData.data[idx + 1] + imageData.data[idx + 2]) / (3 * 255);
+                const brightness = document.getElementById("barrierInvert").checked ? 1 - b : b;
+                // For this example, if brightness is above threshold, set barrier.
+                if (brightness > threshold) {
+                  const simX = offsetX + i;
+                  const simY = offsetY + j;
+                  if (simX >= 0 && simX < gridWidth && simY >= 0 && simY < gridHeight) {
+                    barrierArray[simY * gridWidth + simX] = 1;
+                  }
+                }
+              }
+            }
+            // Write updated barrierArray to barrierBuffer.
+            device.queue.writeBuffer(barrierBuffer, 0, barrierArray.buffer);
+          };
+          img.src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+      });
+      document.getElementById("clearBarriers").addEventListener("click", () => {
+        clearBarriers();
+      });
+      function clearBarriers() {
+        barrierArray.fill(0);
+        device.queue.writeBuffer(barrierBuffer, 0, barrierArray.buffer);
+      }
+
+      // ----- Simulation Loop -----
+      let useBuffer0 = true;
+      function frame() {
+        for (let i = 0; i < speed; i++) {
+          const commandEncoder = device.createCommandEncoder();
+
+          {
+            const collisionPass = commandEncoder.beginComputePass();
+            collisionPass.setPipeline(collisionPipeline);
+            collisionPass.setBindGroup(0, collisionBindGroup(useBuffer0 ? stateBuffer0 : stateBuffer1));
+            collisionPass.dispatchWorkgroups(Math.ceil(gridWidth / 16), Math.ceil(gridHeight / 16));
+            collisionPass.end();
+          }
+
+          {
+            const streamingPass = commandEncoder.beginComputePass();
+            streamingPass.setPipeline(streamingPipeline);
+            streamingPass.setBindGroup(0, streamingBindGroup(useBuffer0 ? stateBuffer1 : stateBuffer0));
+            streamingPass.dispatchWorkgroups(Math.ceil(gridWidth / 16), Math.ceil(gridHeight / 16));
+            streamingPass.end();
+          }
+
+          const textureView = context.getCurrentTexture().createView();
+          const renderPass = commandEncoder.beginRenderPass({
+            colorAttachments: [{
+              view: textureView,
+              clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              loadOp: 'clear',
+              storeOp: 'store',
+            }],
+          });
+          renderPass.setPipeline(renderPipeline);
+          renderPass.setBindGroup(0, renderBindGroup(useBuffer0 ? stateBuffer1 : stateBuffer0));
+          renderPass.draw(6, 1, 0, 0);
+          renderPass.end();
+
+          device.queue.submit([commandEncoder.finish()]);
+          useBuffer0 = !useBuffer0;
+        }
+        requestAnimationFrame(frame);
+      }
+      requestAnimationFrame(frame);
+    })();
+  </script>
+</body>
+
+</html>
