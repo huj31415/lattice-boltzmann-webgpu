@@ -356,7 +356,7 @@ fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
 }
 
 fn colorMap(value:f32) -> vec3<f32> {
-  return vec3<f32>(1.0 - value, 1.0 - abs(value - 0.5), value);
+  return vec3<f32>(value, 1.0 - abs(value - 0.5), 1.0 - value);
 }
 
 @fragment
@@ -368,7 +368,11 @@ fn fs_main(@location(0) fragCoord: vec2<f32>) -> @location(0) vec4<f32> {
   
   // If this cell is a barrier, show red.
   if (barriers[index] == 1) {
-    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+    if (uniforms.vizMode == 1) {
+      return vec4<f32>(0.0);
+    } else {
+      return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+    }
   }
   
   let numDirs: u32 = 9u;
@@ -416,9 +420,9 @@ fn fs_main(@location(0) fragCoord: vec2<f32>) -> @location(0) vec4<f32> {
   
   var color: vec3<f32>;
   if (uniforms.vizMode < 0.5) {
-    color = vec3<f32>(density / 2.);
+    color = colorMap(density * 1.5 - 1.0); // 3 * (density/2 - 0.5) + 0.5
   } else if (uniforms.vizMode < 1.5) {
-    color = colorMap(speed);
+    color = colorMap(2.0 * speed - uniforms.inflow);
   } else if (uniforms.vizMode < 2.5) {
     color = vec3<f32>(abs(curl));
   } else {
