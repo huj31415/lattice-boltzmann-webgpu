@@ -36,6 +36,10 @@
         <label for="viscosity">Viscosity:
           <span id="viscosityValue">0.05</span>
         </label>
+        <div>
+          <input id="noSlip" type="checkbox" checked>
+          <label for="noSlip">No slip top/bottom</label>
+        </div>
       </div>
       <button id="reinit" class="fullwidth">Restart sim</button>
     </div>
@@ -46,7 +50,7 @@
         <span id="simSpeedValue">1</span>
       </label>
       <input id="simRes" type="range" min="1" max="5" step="1" value="1">
-      <label for="simRes">Res (px/cell):
+      <label for="simRes">Resolution:
         <span id="simResValue">1</span>
       </label>
     </div>
@@ -83,6 +87,30 @@
         document.body.textContent = "WebGPU is not supported in this browser.";
         return;
       }
+      const ui = {
+        panel: document.getElementById("controls"),
+        collapse: document.getElementById("toggleSettings"),
+        inflow: document.getElementById("velocity"),
+        vizSelect: document.getElementById("visualization"),
+        velocitySlider: document.getElementById("velocity"),
+        velocityValue: document.getElementById("velocityValue"),
+        reInit: document.getElementById("reinit"),
+        viscositySlider: document.getElementById("viscosity"),
+        viscosityValue: document.getElementById("viscosityValue"),
+        simSpeedSlider: document.getElementById("simSpeed"),
+        simSpeedValue: document.getElementById("simSpeedValue"),
+        simResSlider: document.getElementById("simRes"),
+        simResValue: document.getElementById("simResValue"),
+        barrierUpload: document.getElementById("barrierUpload"),
+        thresholdSlider: document.getElementById("threshold"),
+        thresholdValue: document.getElementById("thresholdValue"),
+        barrierApply: document.getElementById("applyBarrierImage"),
+        imageScale: document.getElementById("imageScale"),
+        barrierInvert: document.getElementById("barrierInvert"),
+        barrierClear: document.getElementById("clearBarriers"),
+        noSlip: document.getElementById("noSlip"),
+      };
+
       let scale = 1;
 
       let width = window.innerWidth;
@@ -141,9 +169,9 @@
 
       // ----- Uniform Buffer -----
       // Uniforms now include an extra "inflow" field (rightward flow velocity)
-      // Layout: [gridWidth, gridHeight, tau, vizMode, inflow]
-      let inflow = parseFloat(document.getElementById("velocity").value);
-      const uniformData = new Float32Array([gridWidth, gridHeight, tau, 2, inflow]);
+      // Layout: [gridWidth, gridHeight, tau, vizMode, inflow, noSlip]
+      let inflow = parseFloat(ui.inflow.value);
+      const uniformData = new Float32Array([gridWidth, gridHeight, tau, 2, inflow, 1]);
       const uniformBuffer = device.createBuffer({
         size: uniformData.byteLength,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -184,6 +212,7 @@
           tau: f32,
           vizMode: f32,
           inflow: f32,
+          noSlip: f32,
         };
         @group(0) @binding(0) var<storage, read> stateIn: array<f32>;
         @group(0) @binding(1) var<storage, read_write> postCollision: array<f32>;
@@ -262,6 +291,7 @@
           tau: f32,
           vizMode: f32,
           inflow: f32,
+          noSlip: f32,
         };
         @group(0) @binding(0) var<storage, read> postCollision: array<f32>;
         @group(0) @binding(1) var<storage, read_write> stateOut: array<f32>;
@@ -293,7 +323,11 @@
               useEquilibrium = true;
               // useOutflow = true;
             } else if (rawSrcY < 0 || rawSrcY >= height) {
-              useBounceBack = true;
+              if (uniforms.noSlip > 0.5) {
+                useBounceBack = true;
+              } else {
+                useEquilibrium = true;
+              }
             } else {
               let srcX = rawSrcX;
               let srcY = rawSrcY;
@@ -344,6 +378,7 @@
           tau: f32,
           vizMode: f32,
           inflow: f32,
+          noSlip: f32,
         };
         @group(0) @binding(0) var<storage, read> state: array<f32>;
         @group(0) @binding(1) var<uniform> uniforms: Uniforms;
@@ -497,55 +532,46 @@
       });
 
       // ----- Visualization UI Control -----
-      const vizSelect = document.getElementById("visualization");
-      vizSelect.addEventListener("change", () => {
-        const mode = vizSelect.value;
+      ui.vizSelect.addEventListener("change", () => {
+        const mode = ui.vizSelect.value;
         const modeVal = mode === "density" ? 0 : mode === "speed" ? 1 : mode === "curl" ? 2 : 3;
         uniformData[3] = modeVal;
         device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer);
       });
 
       // Rightward flow UI.
-      const velocitySlider = document.getElementById("velocity");
-      const velocityValue = document.getElementById("velocityValue");
-      velocitySlider.addEventListener("input", () => {
-        const v = parseFloat(velocitySlider.value);
-        velocityValue.textContent = v.toFixed(2);
+      ui.velocitySlider.addEventListener("input", () => {
+        const v = parseFloat(ui.velocitySlider.value);
+        ui.velocityValue.textContent = v.toFixed(2);
         // Update uniform inflow parameter as well.
         uniformData[4] = v;
         device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer);
       });
-      document.getElementById("reinit").addEventListener("click", () => {
-        const v = parseFloat(velocitySlider.value);
+      ui.reInit.addEventListener("click", () => {
+        const v = parseFloat(ui.velocitySlider.value);
         initializeState(v);
       });
 
       // Viscosity
-      const viscositySlider = document.getElementById("viscosity");
-      const viscosityValue = document.getElementById("viscosityValue");
-      viscositySlider.addEventListener("input", () => {
-        const v = parseFloat(viscositySlider.value);
-        viscosityValue.textContent = v.toFixed(2);
+      ui.viscositySlider.addEventListener("input", () => {
+        const v = parseFloat(ui.viscositySlider.value);
+        ui.viscosityValue.textContent = v.toFixed(2);
         tau = (3 * v + 0.5);
         uniformData[2] = tau;
         device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer);
       });
 
       // Simulation speed
-      const simSpeedSlider = document.getElementById("simSpeed");
-      const simSpeedValue = document.getElementById("simSpeedValue");
-      simSpeedSlider.addEventListener("input", () => {
-        const v = parseInt(simSpeedSlider.value);
-        simSpeedValue.textContent = v;
+      ui.simSpeedSlider.addEventListener("input", () => {
+        const v = parseInt(ui.simSpeedSlider.value);
+        ui.simSpeedValue.textContent = v;
         speed = v;
       });
 
       // Simulation resolution
-      const simResSlider = document.getElementById("simRes");
-      const simResValue = document.getElementById("simResValue");
-      simResSlider.addEventListener("input", () => {
-        scale = parseInt(simResSlider.value);
-        simResValue.textContent = scale;
+      ui.simResSlider.addEventListener("input", () => {
+        scale = parseInt(ui.simResSlider.value);
+        ui.simResValue.textContent = scale;
         refreshGrid();
       });
 
@@ -557,9 +583,15 @@
         uniformData[0] = gridWidth;
         uniformData[1] = gridHeight;
         device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer);
-        initializeState(parseFloat(velocitySlider.value));
+        initializeState(parseFloat(ui.velocitySlider.value));
         clearBarriers();
       }
+
+      // No-slip condition toggle
+      ui.noSlip.addEventListener("click", () => {
+        uniformData[5] = ui.noSlip.checked ? 1 : 0;
+        device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer);
+      });
 
       // ----- Barrier Setting (Mouse Click) -----
       // Flip the y coordinate so that clicking maps directly to simulation coordinates.
@@ -593,23 +625,20 @@
       }
 
       // ----- Barrier Image Upload & Processing -----
-      const barrierUpload = document.getElementById("barrierUpload");
-      const thresholdSlider = document.getElementById("threshold");
-      const thresholdValue = document.getElementById("thresholdValue");
-      thresholdSlider.addEventListener("input", () => {
-        const t = parseFloat(thresholdSlider.value);
-        thresholdValue.textContent = t.toFixed(2);
+      ui.thresholdSlider.addEventListener("input", () => {
+        const t = parseFloat(ui.thresholdSlider.value);
+        ui.thresholdValue.textContent = t.toFixed(2);
       });
-      document.getElementById("applyBarrierImage").addEventListener("click", () => {
-        if (!barrierUpload.files || barrierUpload.files.length === 0) return;
+      ui.barrierApply.addEventListener("click", () => {
+        if (!ui.barrierUpload.files || ui.barrierUpload.files.length === 0) return;
         clearBarriers();
-        const file = barrierUpload.files[0];
+        const file = ui.barrierUpload.files[0];
         const reader = new FileReader();
         reader.onload = (e) => {
           const img = new Image();
           img.onload = () => {
             // Get the UI scale factor.
-            const uiScale = parseFloat(document.getElementById("imageScale").value);
+            const uiScale = parseFloat(ui.imageScale.value);
             // Compute the maximum scale factor to fit the canvas.
             const fitScale = Math.min(gridWidth / img.width, gridHeight / img.height);
             // Final target size: original image scaled by fitScale and then by uiScale.
@@ -625,14 +654,14 @@
             // Compute offsets to center the barrier image in the simulation grid.
             const offsetX = Math.floor((gridWidth - targetWidth) / 2);
             const offsetY = Math.floor((gridHeight - targetHeight) / 2);
-            const threshold = parseFloat(thresholdSlider.value);
+            const threshold = parseFloat(ui.thresholdSlider.value);
             // Update barrierArray: set to 1 for pixels with brightness above threshold.
             for (let j = 0; j < targetHeight; j++) {
               for (let i = 0; i < targetWidth; i++) {
                 const idx = ((targetHeight - j) * targetWidth + i) * 4;
                 // Compute normalized brightness (average of R, G, B).
                 const b = (imageData.data[idx] + imageData.data[idx + 1] + imageData.data[idx + 2]) / (3 * 255);
-                const brightness = document.getElementById("barrierInvert").checked ? 1 - b : b;
+                const brightness = ui.barrierInvert.checked ? 1 - b : b;
                 if (brightness > threshold) {
                   const simX = offsetX + i;
                   const simY = offsetY + j;
@@ -649,7 +678,7 @@
         reader.readAsDataURL(file);
       });
 
-      document.getElementById("clearBarriers").addEventListener("click", () => {
+      ui.barrierClear.addEventListener("click", () => {
         clearBarriers();
       });
       function clearBarriers() {
@@ -701,14 +730,12 @@
       requestAnimationFrame(frame);
 
       // ---- Other event listeners ----
-      const collapse = document.getElementById("toggleSettings");
-      const panel = document.getElementById("controls");
-      collapse.onclick = () => {
-        collapse.innerText = collapse.innerText === ">" ? "<" : ">";
-        if (panel.classList.contains("hidden")) {
-          panel.classList.remove("hidden");
+      ui.collapse.onclick = () => {
+        ui.collapse.innerText = ui.collapse.innerText === ">" ? "<" : ">";
+        if (ui.panel.classList.contains("hidden")) {
+          ui.panel.classList.remove("hidden");
         } else {
-          panel.classList.add("hidden");
+          ui.panel.classList.add("hidden");
         }
       };
       window.onresize = () => {
@@ -716,7 +743,6 @@
         width = canvas.width = window.innerWidth;
         height = canvas.height = window.innerHeight;
         refreshGrid();
-        console.log(width, height, gridWidth, gridHeight)
       }
     })();
   </script>
