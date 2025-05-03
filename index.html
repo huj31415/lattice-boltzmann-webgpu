@@ -689,9 +689,8 @@
       // ----- Simulation Loop -----
       let useBuffer0 = true;
       function frame() {
+        const commandEncoder = device.createCommandEncoder();
         for (let i = 0; i < speed; i++) {
-          const commandEncoder = device.createCommandEncoder();
-
           {
             const collisionPass = commandEncoder.beginComputePass();
             collisionPass.setPipeline(collisionPipeline);
@@ -707,24 +706,24 @@
             streamingPass.dispatchWorkgroups(Math.ceil(gridWidth / 16), Math.ceil(gridHeight / 16));
             streamingPass.end();
           }
-
-          const textureView = context.getCurrentTexture().createView();
-          const renderPass = commandEncoder.beginRenderPass({
-            colorAttachments: [{
-              view: textureView,
-              clearValue: { r: 0, g: 0, b: 0, a: 1 },
-              loadOp: 'clear',
-              storeOp: 'store',
-            }],
-          });
-          renderPass.setPipeline(renderPipeline);
-          renderPass.setBindGroup(0, renderBindGroup(useBuffer0 ? stateBuffer1 : stateBuffer0));
-          renderPass.draw(6, 1, 0, 0);
-          renderPass.end();
-
-          device.queue.submit([commandEncoder.finish()]);
           useBuffer0 = !useBuffer0;
         }
+
+        const textureView = context.getCurrentTexture().createView();
+        const renderPass = commandEncoder.beginRenderPass({
+          colorAttachments: [{
+            view: textureView,
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: 'clear',
+            storeOp: 'store',
+          }],
+        });
+        renderPass.setPipeline(renderPipeline);
+        renderPass.setBindGroup(0, renderBindGroup(useBuffer0 ? stateBuffer1 : stateBuffer0));
+        renderPass.draw(6, 1, 0, 0);
+        renderPass.end();
+
+        device.queue.submit([commandEncoder.finish()]);
         requestAnimationFrame(frame);
       }
       requestAnimationFrame(frame);
