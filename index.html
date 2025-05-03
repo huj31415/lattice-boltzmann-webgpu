@@ -36,10 +36,10 @@
         <label for="viscosity">Viscosity:
           <span id="viscosityValue">0.05</span>
         </label>
-        <div>
-          <input id="noSlip" type="checkbox" checked>
-          <label for="noSlip">No slip top/bottom</label>
-        </div>
+      </div>
+      <div>
+        <input id="noSlip" type="checkbox" checked>
+        <label for="noSlip">No slip top/bottom</label>
       </div>
       <button id="reinit" class="fullwidth">Restart sim</button>
     </div>
@@ -602,9 +602,9 @@
         isDrawing = true;
         placeBarrier(event);
       });
-      canvas.addEventListener("mousemove", (event) => {
+      canvas.addEventListener("pointermove", (event) => {
         if (isDrawing) {
-          placeBarrier(event);
+          event.getCoalescedEvents().forEach((event) => placeBarrier(event));
         }
       });
       canvas.addEventListener("mouseup", () => {
