@@ -510,31 +510,67 @@
   // Flip the y coordinate so that clicking maps directly to simulation coordinates.
   const barrierArray = new Int32Array(numCells);
   let isDrawing = false;
-  let erase;
+  let erase = null;
+  let lastPos = null;
+
   canvas.addEventListener("mousedown", (event) => {
     isDrawing = true;
+    lastPos = null;
     placeBarrier(event);
   });
+
   canvas.addEventListener("pointermove", (event) => {
-    if (isDrawing) {
-      event.getCoalescedEvents().forEach((event) => placeBarrier(event));
-    }
+    if (!isDrawing) return;
+    event.getCoalescedEvents().forEach((e) => placeBarrier(e));
   });
+
   canvas.addEventListener("mouseup", () => {
     isDrawing = false;
     erase = null;
+    lastPos = null;
   });
+
   function placeBarrier(event) {
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / (scale * rect.width);
     const scaleY = canvas.height / (scale * rect.height);
     const x = Math.floor((event.clientX - rect.left) * scaleX);
-    // Flip y so that the top of the canvas is y=gridHeight-1.
     const y = gridHeight - 1 - Math.floor((event.clientY - rect.top) * scaleY);
+
+    // Interpolate from lastPos to (x, y)
+    if (lastPos) {
+      const dx = x - lastPos.x;
+      const dy = y - lastPos.y;
+      const dist = Math.hypot(dx, dy);
+      const steps = Math.ceil(dist);
+      for (let i = 1; i <= steps; i++) {
+        const ix = Math.round(lastPos.x + dx * (i / steps));
+        const iy = Math.round(lastPos.y + dy * (i / steps));
+        placeBarrierAt(ix, iy);
+      }
+    } else {
+      placeBarrierAt(x, y);
+    }
+
+    lastPos = { x, y };
+  }
+
+  function placeBarrierAt(x, y) {
+    if (x < 0 || x >= gridWidth || y < 0 || y >= gridHeight) return;
     const index = y * gridWidth + x;
-    if (erase === null) erase = barrierArray[index] === 0 ? 1 : 0;
-    barrierArray[index] = erase; //barrierArray[index] === 0 ? 1 : 0;
-    device.queue.writeBuffer(barrierBuffer, index * Int32Array.BYTES_PER_ELEMENT, new Int32Array([barrierArray[index]]));
+
+    // Set erase mode based on first contact
+    if (erase === null) {
+      erase = barrierArray[index] === 0 ? 1 : 0;
+    }
+
+    barrierArray[index] = erase;
+
+    device.queue.writeBuffer(
+      barrierBuffer,
+      index * Int32Array.BYTES_PER_ELEMENT,
+      new Int32Array([barrierArray[index]])
+    );
   }
 
   // ----- Barrier Image Upload & Processing -----
@@ -633,7 +669,7 @@
     });
     renderPass.setPipeline(renderPipeline);
     renderPass.setBindGroup(0, renderBindGroup(useBuffer0 ? stateBuffer1 : stateBuffer0));
-    renderPass.draw(6, 1, 0, 0);
+    renderPass.draw(3, 1, 0, 0);
     renderPass.end();
 
     device.queue.submit([commandEncoder.finish()]);
